@@ -27,6 +27,16 @@ app.post('/cut', async (req, res) => {
   });
 });
 
+app.post('/extract-audio-full', (req, res) => {
+  const { inputUrl } = req.body;
+  const outFile = `/tmp/audio_${Date.now()}.mp3`;
+  const cmd = `ffmpeg -i "${inputUrl}" -vn -acodec mp3 -ab 16k -ac 1 -ar 16000 -y ${outFile}`;
+  exec(cmd, { timeout: 120000 }, (err) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.download(outFile, () => fs.unlinkSync(outFile));
+  });
+});
+
 app.post('/render', async (req, res) => {
   const { inputUrl, captionStyle, hookText } = req.body;
   const outFile = `/tmp/render_${Date.now()}.mp4`;
