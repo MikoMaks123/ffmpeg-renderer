@@ -8,6 +8,8 @@ app.use(express.json());
 
 const API_KEY = process.env.API_KEY || 'changeme';
 
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 app.use((req, res, next) => {
   if (req.headers['x-api-key'] !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -42,6 +44,5 @@ app.post('/render', async (req, res) => {
   });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(3000, () => console.log('FFmpeg renderer running on port 3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`FFmpeg renderer running on port ${PORT}`));
