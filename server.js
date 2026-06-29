@@ -213,7 +213,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 }
 
 app.post('/render', async (req, res) => {
-  const { inputUrl, captionStyle, segments, hookText } = req.body;
+  const { inputUrl, captionStyle, segments, hookText, 
+          titleOverlay, blurBackground } = req.body;
   if (!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
 
   const workDir = path.join(os.tmpdir(), uuidv4());
@@ -232,9 +233,6 @@ app.post('/render', async (req, res) => {
       );
     });
 
-    const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
-    console.log('[render] Downloaded:', sizeMB, 'MB');
-
     let videoDuration = 30;
     try {
       const probe = execSync(
@@ -244,27 +242,41 @@ app.post('/render', async (req, res) => {
       videoDuration = parseFloat(probe) || 30;
     } catch (_) {}
 
-    const assContent = generateASS(captionStyle, segments, hookText, videoDuration);
+    // Build ASS with optional title overlay
+    const assContent = generateASSWithTitle(
+      captionStyle, segments, hookText, videoDuration, titleOverlay
+    );
     fs.writeFileSync(assPath, assContent, 'utf8');
-    console.log('[render] ASS generated, duration:', videoDuration);
 
     const assEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
+    // Build video filter
+    let vf;
+    if (blurBackground) {
+      vf = `[0:v]scale=1080:1920,boxblur=20:5[bg];[0:v]scale=1080:608,setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=${assEscaped}`;
+    } else {
+      vf = `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,ass=${assEscaped}`;
+    }
+
     await new Promise((resolve, reject) => {
-      const args = [
-        '-y', '-i', inputPath,
-        '-vf', `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,ass=${assEscaped}`,
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
-        outputPath,
-      ];
+      const args = blurBackground
+        ? ['-y', '-i', inputPath,
+           '-filter_complex', vf,
+           '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+           '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+           outputPath]
+        : ['-y', '-i', inputPath,
+           '-vf', vf,
+           '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+           '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+           outputPath];
+
       const ff = spawn('ffmpeg', args);
       ff.stderr.on('data', d => process.stderr.write(d));
-      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`)));
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
     });
 
     const stat = fs.statSync(outputPath);
-    console.log('[render] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
@@ -279,4 +291,28 @@ app.post('/render', async (req, res) => {
   }
 });
 
+function generateASSWithTitle(captionStyle, segments, hookText, videoDuration, titleOverlay) {
+  const base = generateASS(captionStyle, segments, hookText, videoDuration);
+  
+  if (!titleOverlay || !titleOverlay.text) return base;
+
+  const titleAlign = titleOverlay.position === 'TOP' ? 8 : 
+                     titleOverlay.position === 'CENTER' ? 5 : 2;
+  const titleColor = hexToAss((titleOverlay.color || '#ffffff').replace('#',''));
+  const titleSize = titleOverlay.fontSize || 72;
+  const titleBg = titleOverlay.showBackground ? '&H99000000' : '&H00000000';
+  const safeTitle = (titleOverlay.text || '')
+    .replace(/'/g, "\\'").replace(/:/g, "\\:");
+
+  const titleStyle = `Style: Title,Impact,${titleSize},${titleColor},${titleColor},&H00000000,${titleBg},1,0,0,0,100,100,0,0,1,3,0,${titleAlign},40,40,60,1`;
+  const titleDialogue = `Dialogue: 0,0:00:00.00,${toAssTime(videoDuration)},Title,,0,0,0,,${safeTitle}`;
+
+  return base
+    .replace('Style: Highlight,', titleStyle + '\nStyle: Highlight,')
+    .replace('[Events]', '[Events]\n' + titleDialogue.split('\n')[0])
+    .replace(
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n',
+      'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n' + titleDialogue + '\n'
+    );
+}
 app.listen(process.env.PORT || 3000, () => console.log('FFmpeg server running'));
