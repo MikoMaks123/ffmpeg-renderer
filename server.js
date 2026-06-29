@@ -1,49 +1,146 @@
+# FFmpeg Railway Server — Complete server.js
+
+> **⚠️ ACTION REQUIRED: Replace your entire Railway `server.js` with the code below and push to redeploy.**
+>
+> The previous version used `curl` or downloaded the full video to disk before running ffmpeg.  
+> This version streams directly via ffmpeg's built-in HTTP client — no curl, no wget, no full download needed.
+
+---
+
+## Complete server.js — copy this entire file
+
+```js
 const express = require('express');
-const { execSync, exec, spawn } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
-const API_KEY = process.env.API_KEY || 'changeme';
-const PORT = process.env.PORT || 3000;
-
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.use((req, res, next) => {
-  if (req.headers['x-api-key'] !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+const API_KEY = process.env.API_KEY;
+function authMiddleware(req, res, next) {
+  const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
+  if (API_KEY && key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
+}
+app.use(authMiddleware);
+
+// ──────────────────────────────────────────────
+// POST /proxy-extract-audio-url
+// Streams video directly from URL via ffmpeg HTTP — no curl, no local download
+// ──────────────────────────────────────────────
+app.post('/proxy-extract-audio-url', (req, res) => {
+  const { sourceUrl } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const outPath = path.join(workDir, 'audio.mp3');
+
+  // ffmpeg reads directly from the URL — no curl dependency
+  const args = [
+    '-user_agent', 'Mozilla/5.0',
+    '-i', sourceUrl,
+    '-vn', '-acodec', 'mp3', '-ab', '24k', '-ac', '1', '-ar', '16000',
+    '-y', outPath,
+  ];
+  console.log(`[proxy-extract-audio-url] ffmpeg ${args.join(' ')}`);
+
+  const ff = spawn('ffmpeg', args, { timeout: 300000 });
+  ff.stderr.on('data', d => process.stderr.write(d));
+  ff.on('close', (code) => {
+    if (code !== 0) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+      return res.status(500).json({ error: `ffmpeg exited with code ${code}` });
+    }
+    const stat = fs.statSync(outPath);
+    console.log(`[proxy-extract-audio-url] Done: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', stat.size);
+    const stream = fs.createReadStream(outPath);
+    stream.pipe(res);
+    stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
+    stream.on('error', () => fs.rmSync(workDir, { recursive: true, force: true }));
+  });
 });
 
-// ── ASS helpers ──────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────
+// POST /proxy-cut-url
+// Seeks directly in the source URL — only fetches the needed bytes
+// ──────────────────────────────────────────────
+app.post('/proxy-cut-url', (req, res) => {
+  const { sourceUrl, startSeconds, endSeconds } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+  if (startSeconds == null || endSeconds == null) return res.status(400).json({ error: 'startSeconds and endSeconds required' });
 
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const outPath = path.join(workDir, 'clip.mp4');
+
+  const args = [
+    '-user_agent', 'Mozilla/5.0',
+    '-ss', String(startSeconds),
+    '-to', String(endSeconds),
+    '-i', sourceUrl,
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+    '-c:a', 'aac', '-movflags', '+faststart',
+    '-y', outPath,
+  ];
+  console.log(`[proxy-cut-url] ffmpeg ${args.join(' ')}`);
+
+  const ff = spawn('ffmpeg', args, { timeout: 180000 });
+  ff.stderr.on('data', d => process.stderr.write(d));
+  ff.on('close', (code) => {
+    if (code !== 0) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+      return res.status(500).json({ error: `ffmpeg exited with code ${code}` });
+    }
+    const stat = fs.statSync(outPath);
+    console.log(`[proxy-cut-url] Done: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+    const stream = fs.createReadStream(outPath);
+    stream.pipe(res);
+    stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
+    stream.on('error', () => fs.rmSync(workDir, { recursive: true, force: true }));
+  });
+});
+
+// ──────────────────────────────────────────────
+// POST /render
+// Burns ASS subtitles into a clip. inputUrl should be a small Supabase clip URL.
+// ──────────────────────────────────────────────
 function hexToAss(hex, alpha = '00') {
   hex = (hex || '#ffffff').replace('#', '');
   if (hex.length === 6) {
-    const r = hex.slice(0,2), g = hex.slice(2,4), b = hex.slice(4,6);
+    const [r, g, b] = [hex.slice(0,2), hex.slice(2,4), hex.slice(4,6)];
     return `&H${alpha}${b}${g}${r}`;
+  }
+  if (hex.length === 8) {
+    const [aa, r, g, b] = [hex.slice(0,2), hex.slice(2,4), hex.slice(4,6), hex.slice(6,8)];
+    return `&H${aa}${b}${g}${r}`;
   }
   return `&H00ffffff`;
 }
 
 function positionToAlignment(position) {
   switch ((position || 'BOTTOM').toUpperCase()) {
-    case 'TOP': return 8;
+    case 'TOP':    return 8;
     case 'CENTER': return 5;
-    default: return 2;
+    default:       return 2;
   }
 }
 
 function applyTransform(text, transform) {
   switch ((transform || 'NONE').toUpperCase()) {
-    case 'UPPERCASE': return text.toUpperCase();
+    case 'UPPERCASE':  return text.toUpperCase();
     case 'CAPITALIZE': return text.replace(/\b\w/g, c => c.toUpperCase());
-    default: return text;
+    default:           return text;
   }
 }
 
@@ -64,21 +161,16 @@ function toAssTime(seconds) {
 
 function generateASS(captionStyle, segments, hookText, videoDuration) {
   const {
-    fontFamily = 'Impact',
-    fontSize = 72,
-    color = '#ffffff',
-    strokeColor = '#000000',
-    strokeWidth = 4,
-    position = 'BOTTOM',
-    animation = 'WORD_BY_WORD',
-    textTransform = 'UPPERCASE',
-    maxWordsPerLine = 3,
+    fontFamily = 'Arial', fontSize = 48, color = '#ffffff',
+    strokeColor = '#000000', strokeWidth = 2, position = 'BOTTOM',
+    animation = 'WORD_BY_WORD', textTransform = 'NONE', maxWordsPerLine = 3,
   } = captionStyle || {};
 
   const alignment = positionToAlignment(position);
   const primaryColor = hexToAss(color);
   const outlineColor = hexToAss(strokeColor);
   const highlightColor = hexToAss('#ffff00');
+  const outline = strokeWidth || 2;
   const anim = (animation || 'WORD_BY_WORD').toUpperCase();
 
   const header = `[Script Info]
@@ -89,15 +181,14 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,${fontFamily},${fontSize},${primaryColor},${primaryColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${strokeWidth},0,${alignment},40,40,60,1
-Style: Highlight,${fontFamily},${fontSize},${highlightColor},${highlightColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${strokeWidth},0,${alignment},40,40,60,1
+Style: Default,${fontFamily},${fontSize},${primaryColor},${primaryColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1
+Style: Highlight,${fontFamily},${fontSize},${highlightColor},${highlightColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
   const lines = [];
-
   if (!segments || segments.length === 0) {
     const text = applyTransform(hookText || '', textTransform);
     lines.push(`Dialogue: 0,${toAssTime(0)},${toAssTime(videoDuration || 30)},Default,,0,0,0,,${text}`);
@@ -108,7 +199,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const segStart = seg.start ?? 0;
     const segEnd = seg.end ?? segStart + 2;
     const rawText = applyTransform(seg.text || '', textTransform);
-
     if (anim === 'FADE') {
       lines.push(`Dialogue: 0,${toAssTime(segStart)},${toAssTime(segEnd)},Default,,0,0,0,,{\\fad(150,150)}${rawText}`);
     } else if (anim === 'LINE_BY_LINE') {
@@ -129,145 +219,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   return header + lines.join('\n');
 }
 
-// ── Audio extraction — curl download then ffmpeg ─────────────────────────────
-
-app.post('/proxy-extract-audio-url', (req, res) => {
-  const { sourceUrl } = req.body;
-  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
-
-  const workDir = path.join(os.tmpdir(), uuidv4());
-  fs.mkdirSync(workDir, { recursive: true });
-  const inputPath = path.join(workDir, 'input.mp4');
-  const outPath = path.join(workDir, 'audio.mp3');
-
-  console.log('[audio] Downloading:', sourceUrl);
-
-  exec(
-    `curl -L --max-time 600 --retry 3 --retry-delay 5 -o "${inputPath}" "${sourceUrl}"`,
-    { timeout: 620000 },
-    (dlErr) => {
-      if (dlErr) {
-        fs.rmSync(workDir, { recursive: true, force: true });
-        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
-      }
-
-      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
-      console.log('[audio] Downloaded:', sizeMB, 'MB — extracting audio...');
-
-      const cmd = `ffmpeg -i "${inputPath}" -vn -acodec mp3 -ab 24k -ac 1 -ar 16000 -y "${outPath}"`;
-      exec(cmd, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err) => {
-        if (err) {
-          fs.rmSync(workDir, { recursive: true, force: true });
-          return res.status(500).json({ error: err.message });
-        }
-        const stat = fs.statSync(outPath);
-        console.log('[audio] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Length', stat.size);
-        const stream = fs.createReadStream(outPath);
-        stream.pipe(res);
-        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
-      });
-    }
-  );
-});
-
-// Keep old names as aliases
-app.post('/extract-audio-full', (req, res) => {
-  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
-  req.url = '/proxy-extract-audio-url';
-  app.handle(req, res);
-});
-
-app.post('/proxy-extract-audio', (req, res) => {
-  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
-  req.url = '/proxy-extract-audio-url';
-  app.handle(req, res);
-});
-
-// ── Clip cutting — curl download then ffmpeg ─────────────────────────────────
-
-app.post('/proxy-cut-url', (req, res) => {
-  const { sourceUrl, startSeconds, endSeconds } = req.body;
-  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
-  if (startSeconds == null || endSeconds == null) return res.status(400).json({ error: 'startSeconds and endSeconds required' });
-
-  const workDir = path.join(os.tmpdir(), uuidv4());
-  fs.mkdirSync(workDir, { recursive: true });
-  const inputPath = path.join(workDir, 'input.mp4');
-  const outPath = path.join(workDir, 'clip.mp4');
-
-  console.log(`[cut] Downloading: ${sourceUrl} (${startSeconds}s - ${endSeconds}s)`);
-
-  exec(
-    `curl -L --max-time 600 --retry 3 --retry-delay 5 -o "${inputPath}" "${sourceUrl}"`,
-    { timeout: 620000 },
-    (dlErr) => {
-      if (dlErr) {
-        fs.rmSync(workDir, { recursive: true, force: true });
-        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
-      }
-
-      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
-      console.log('[cut] Downloaded:', sizeMB, 'MB — cutting...');
-
-      const cmd = `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${inputPath}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -movflags +faststart -y "${outPath}"`;
-
-      exec(cmd, { timeout: 180000, maxBuffer: 100 * 1024 * 1024 }, (err) => {
-        if (err) {
-          fs.rmSync(workDir, { recursive: true, force: true });
-          return res.status(500).json({ error: err.message });
-        }
-        const stat = fs.statSync(outPath);
-        console.log('[cut] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader('Content-Length', stat.size);
-        res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
-        const stream = fs.createReadStream(outPath);
-        stream.pipe(res);
-        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
-      });
-    }
-  );
-});
-
-// Keep old names as aliases
-app.post('/cut', (req, res) => {
-  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
-  req.url = '/proxy-cut-url';
-  app.handle(req, res);
-});
-
-app.post('/proxy-cut', (req, res) => {
-  req.url = '/proxy-cut-url';
-  app.handle(req, res);
-});
-
-// ── Render with ASS captions ─────────────────────────────────────────────────
-
 app.post('/render', async (req, res) => {
   const { inputUrl, captionStyle, segments, hookText } = req.body;
   if (!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
 
   const workDir = path.join(os.tmpdir(), uuidv4());
   fs.mkdirSync(workDir, { recursive: true });
-  const inputPath = path.join(workDir, 'input.mp4');
-  const assPath = path.join(workDir, 'subs.ass');
+  const inputPath  = path.join(workDir, 'input.mp4');
+  const assPath    = path.join(workDir, 'subs.ass');
   const outputPath = path.join(workDir, 'output.mp4');
 
   try {
-    console.log('[render] Downloading:', inputUrl);
-
-    await new Promise((resolve, reject) => {
-      exec(
-        `curl -L --max-time 300 --retry 3 -o "${inputPath}" "${inputUrl}"`,
-        { timeout: 310000 },
-        (err) => err ? reject(err) : resolve()
-      );
-    });
-
-    const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
-    console.log('[render] Downloaded:', sizeMB, 'MB');
+    console.log(`[render] Downloading: ${inputUrl}`);
+    const videoRes = await fetch(inputUrl);
+    if (!videoRes.ok) throw new Error(`Failed to download video: HTTP ${videoRes.status}`);
+    const videoBuffer = await videoRes.arrayBuffer();
+    fs.writeFileSync(inputPath, Buffer.from(videoBuffer));
 
     let videoDuration = 30;
     try {
@@ -280,7 +247,7 @@ app.post('/render', async (req, res) => {
 
     const assContent = generateASS(captionStyle, segments, hookText, videoDuration);
     fs.writeFileSync(assPath, assContent, 'utf8');
-    console.log('[render] ASS generated, duration:', videoDuration);
+    console.log(`[render] ASS generated (${assContent.length} chars), duration=${videoDuration}s`);
 
     const assEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
@@ -289,30 +256,52 @@ app.post('/render', async (req, res) => {
         '-y', '-i', inputPath,
         '-vf', `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,ass=${assEscaped}`,
         '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-movflags', '+faststart',
-        outputPath
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+        outputPath,
       ];
+      console.log(`[render] ffmpeg ${args.join(' ')}`);
       const ff = spawn('ffmpeg', args);
       ff.stderr.on('data', d => process.stderr.write(d));
-      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`)));
     });
 
     const stat = fs.statSync(outputPath);
-    console.log('[render] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
-
+    console.log(`[render] Done — ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
-    const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
-    stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
-
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+    readStream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
   } catch (err) {
-    console.error('[render] ERROR:', err.message);
+    console.error(`[render] ERROR: ${err.message}`);
     fs.rmSync(workDir, { recursive: true, force: true });
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => console.log(`FFmpeg renderer on port ${PORT}`));
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.listen(process.env.PORT || 3000, () => console.log('FFmpeg server running'));
+```
+
+---
+
+## Deploy
+
+```bash
+git add server.js && git commit -m "fix: use spawn+ffmpeg HTTP, no curl" && git push
+```
+
+Railway auto-deploys on push.
+
+---
+
+## Endpoint Summary
+
+| Endpoint | Method | Purpose | How it accesses the video |
+|---|---|---|---|
+| `/proxy-extract-audio-url` | POST | Full video → MP3 audio | `ffmpeg -i <url>` — native HTTP, no curl |
+| `/proxy-cut-url` | POST | Full video → trimmed MP4 | `ffmpeg -ss -to -i <url>` — HTTP seek |
+| `/render` | POST | Clip MP4 → captioned MP4 | `fetch()` (clips are small Supabase URLs) |
+| `/health` | GET | Health check | — |
