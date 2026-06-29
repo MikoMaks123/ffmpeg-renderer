@@ -67,40 +67,43 @@ app.post('/proxy-cut-url', (req, res) => {
 
   const workDir = path.join(os.tmpdir(), uuidv4());
   fs.mkdirSync(workDir, { recursive: true });
-  const inputPath = path.join(workDir, 'input.mp4');
   const outPath = path.join(workDir, 'clip.mp4');
 
-  console.log('[cut] Downloading via curl:', sourceUrl);
-  exec(
-    `curl -L --max-time 600 --retry 3 -A "Mozilla/5.0" -o "${inputPath}" "${sourceUrl}"`,
-    { timeout: 620000 },
-    (dlErr) => {
-      if (dlErr) {
-        fs.rmSync(workDir, { recursive: true, force: true });
-        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
-      }
-      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
-      console.log('[cut] Downloaded:', sizeMB, 'MB');
-      exec(
-        `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${inputPath}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -movflags +faststart -y "${outPath}"`,
-        { timeout: 180000, maxBuffer: 100 * 1024 * 1024 },
-        (err) => {
-          if (err) {
-            fs.rmSync(workDir, { recursive: true, force: true });
-            return res.status(500).json({ error: err.message });
-          }
-          const stat = fs.statSync(outPath);
-          console.log('[cut] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
-          res.setHeader('Content-Type', 'video/mp4');
-          res.setHeader('Content-Length', stat.size);
-          res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
-          const stream = fs.createReadStream(outPath);
-          stream.pipe(res);
-          stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
-        }
-      );
+  // Use ffmpeg directly with URL — seeks without downloading full file
+  const args = [
+    '-ss', String(Math.max(0, startSeconds - 1)),
+    '-to', String(endSeconds + 1),
+    '-i', sourceUrl,
+    '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+    '-c:a', 'aac', '-movflags', '+faststart',
+    '-y', outPath,
+  ];
+
+  console.log('[cut] Cutting from URL directly:', sourceUrl, startSeconds, '-', endSeconds);
+  const ff = spawn('ffmpeg', args);
+  let stderrOutput = '';
+  ff.stderr.on('data', d => {
+    stderrOutput += d.toString();
+    process.stderr.write(d);
+  });
+  ff.on('close', (code) => {
+    if (code !== 0) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+      return res.status(500).json({ 
+        error: `ffmpeg exited with code ${code}`,
+        stderr: stderrOutput.slice(-1000)
+      });
     }
-  );
+    const stat = fs.statSync(outPath);
+    console.log('[cut] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+    const stream = fs.createReadStream(outPath);
+    stream.pipe(res);
+    stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
+  });
 });
 
 function hexToAss(hex, alpha = '00') {
