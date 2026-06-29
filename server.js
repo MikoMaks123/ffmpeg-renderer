@@ -1,5 +1,5 @@
 const express = require('express');
-const { execSync, spawn } = require('child_process');
+const { execSync, exec, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -10,7 +10,6 @@ app.use(express.json());
 
 const API_KEY = process.env.API_KEY;
 
-// /health PRZED auth middleware
 app.get('/health', (req, res) => res.json({ ok: true, status: 'ok' }));
 
 function authMiddleware(req, res, next) {
@@ -26,32 +25,39 @@ app.post('/proxy-extract-audio-url', (req, res) => {
 
   const workDir = path.join(os.tmpdir(), uuidv4());
   fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
   const outPath = path.join(workDir, 'audio.mp3');
 
-  const args = [
-    '-user_agent', 'Mozilla/5.0',
-    '-i', sourceUrl,
-    '-vn', '-acodec', 'mp3', '-ab', '24k', '-ac', '1', '-ar', '16000',
-    '-y', outPath,
-  ];
-  console.log(`[audio] ffmpeg ${args.join(' ')}`);
-
-  const ff = spawn('ffmpeg', args);
-  ff.stderr.on('data', d => process.stderr.write(d));
-  ff.on('close', (code) => {
-    if (code !== 0) {
-      fs.rmSync(workDir, { recursive: true, force: true });
-      return res.status(500).json({ error: `ffmpeg exited with code ${code}` });
+  console.log('[audio] Downloading via curl:', sourceUrl);
+  exec(
+    `curl -L --max-time 600 --retry 3 -A "Mozilla/5.0" -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 620000 },
+    (dlErr) => {
+      if (dlErr) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
+      }
+      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+      console.log('[audio] Downloaded:', sizeMB, 'MB');
+      exec(
+        `ffmpeg -i "${inputPath}" -vn -acodec mp3 -ab 24k -ac 1 -ar 16000 -y "${outPath}"`,
+        { timeout: 300000, maxBuffer: 10 * 1024 * 1024 },
+        (err) => {
+          if (err) {
+            fs.rmSync(workDir, { recursive: true, force: true });
+            return res.status(500).json({ error: err.message });
+          }
+          const stat = fs.statSync(outPath);
+          console.log('[audio] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.setHeader('Content-Length', stat.size);
+          const stream = fs.createReadStream(outPath);
+          stream.pipe(res);
+          stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
+        }
+      );
     }
-    const stat = fs.statSync(outPath);
-    console.log(`[audio] Done: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', stat.size);
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
-    stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
-    stream.on('error', () => fs.rmSync(workDir, { recursive: true, force: true }));
-  });
+  );
 });
 
 app.post('/proxy-cut-url', (req, res) => {
@@ -61,37 +67,40 @@ app.post('/proxy-cut-url', (req, res) => {
 
   const workDir = path.join(os.tmpdir(), uuidv4());
   fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
   const outPath = path.join(workDir, 'clip.mp4');
 
-  const args = [
-    '-user_agent', 'Mozilla/5.0',
-    '-ss', String(startSeconds),
-    '-to', String(endSeconds),
-    '-i', sourceUrl,
-    '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-    '-c:a', 'aac', '-movflags', '+faststart',
-    '-y', outPath,
-  ];
-  console.log(`[cut] ffmpeg ${args.join(' ')}`);
-
-  const ff = spawn('ffmpeg', args);
-  ff.stderr.on('data', d => process.stderr.write(d));
-  ff.on('close', (code) => {
-    if (code !== 0) {
-      fs.rmSync(workDir, { recursive: true, force: true });
-      return res.status(500).json({ error: `ffmpeg exited with code ${code}` });
+  console.log('[cut] Downloading via curl:', sourceUrl);
+  exec(
+    `curl -L --max-time 600 --retry 3 -A "Mozilla/5.0" -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 620000 },
+    (dlErr) => {
+      if (dlErr) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
+      }
+      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+      console.log('[cut] Downloaded:', sizeMB, 'MB');
+      exec(
+        `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${inputPath}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -movflags +faststart -y "${outPath}"`,
+        { timeout: 180000, maxBuffer: 100 * 1024 * 1024 },
+        (err) => {
+          if (err) {
+            fs.rmSync(workDir, { recursive: true, force: true });
+            return res.status(500).json({ error: err.message });
+          }
+          const stat = fs.statSync(outPath);
+          console.log('[cut] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+          res.setHeader('Content-Type', 'video/mp4');
+          res.setHeader('Content-Length', stat.size);
+          res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+          const stream = fs.createReadStream(outPath);
+          stream.pipe(res);
+          stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
+        }
+      );
     }
-    const stat = fs.statSync(outPath);
-    console.log(`[cut] Done: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
-    stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
-    stream.on('error', () => fs.rmSync(workDir, { recursive: true, force: true }));
-  });
+  );
 });
 
 function hexToAss(hex, alpha = '00') {
@@ -211,10 +220,17 @@ app.post('/render', async (req, res) => {
   const outputPath = path.join(workDir, 'output.mp4');
 
   try {
-    console.log(`[render] Downloading: ${inputUrl}`);
-    const videoRes = await fetch(inputUrl);
-    if (!videoRes.ok) throw new Error(`Download failed: HTTP ${videoRes.status}`);
-    fs.writeFileSync(inputPath, Buffer.from(await videoRes.arrayBuffer()));
+    console.log('[render] Downloading:', inputUrl);
+    await new Promise((resolve, reject) => {
+      exec(
+        `curl -L --max-time 300 --retry 3 -A "Mozilla/5.0" -o "${inputPath}" "${inputUrl}"`,
+        { timeout: 310000 },
+        (err) => err ? reject(err) : resolve()
+      );
+    });
+
+    const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+    console.log('[render] Downloaded:', sizeMB, 'MB');
 
     let videoDuration = 30;
     try {
@@ -227,7 +243,7 @@ app.post('/render', async (req, res) => {
 
     const assContent = generateASS(captionStyle, segments, hookText, videoDuration);
     fs.writeFileSync(assPath, assContent, 'utf8');
-    console.log(`[render] ASS generated, duration=${videoDuration}s`);
+    console.log('[render] ASS generated, duration:', videoDuration);
 
     const assEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
@@ -245,7 +261,7 @@ app.post('/render', async (req, res) => {
     });
 
     const stat = fs.statSync(outputPath);
-    console.log(`[render] Done: ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
+    console.log('[render] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
@@ -254,7 +270,7 @@ app.post('/render', async (req, res) => {
     stream.on('close', () => fs.rmSync(workDir, { recursive: true, force: true }));
 
   } catch (err) {
-    console.error(`[render] ERROR: ${err.message}`);
+    console.error('[render] ERROR:', err.message);
     fs.rmSync(workDir, { recursive: true, force: true });
     res.status(500).json({ error: err.message });
   }
