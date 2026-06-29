@@ -6,77 +6,33 @@ const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-const API_KEY = process.env.API_KEY;
+const API_KEY = process.env.API_KEY || 'changeme';
+const PORT = process.env.PORT || 3000;
 
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use((req, res, next) => {
-  const key = req.headers['x-api-key'] || (req.headers['authorization'] || '').replace('Bearer ', '');
-  if (API_KEY && key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (req.headers['x-api-key'] !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   next();
 });
 
-app.post('/proxy-extract-audio-url', (req, res) => {
-  const { sourceUrl } = req.body;
-  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
-  const workDir = path.join(os.tmpdir(), uuidv4());
-  fs.mkdirSync(workDir, { recursive: true });
-  const outPath = path.join(workDir, 'audio.mp3');
-  const cmd = `ffmpeg -i "${sourceUrl}" -vn -acodec mp3 -ab 24k -ac 1 -ar 16000 -y "${outPath}"`;
-  console.log('[proxy-extract-audio-url]', cmd);
-  exec(cmd, { timeout: 300000, maxBuffer: 10*1024*1024 }, (err) => {
-    if (err) {
-      fs.rmSync(workDir, { recursive: true, force: true });
-      return res.status(500).json({ error: err.message });
-    }
-    const stat = fs.statSync(outPath);
-    console.log('[proxy-extract-audio-url] Audio:', (stat.size/1024/1024).toFixed(2), 'MB');
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Length', stat.size);
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
-    stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
-  });
-});
+// ── ASS helpers ──────────────────────────────────────────────────────────────
 
-app.post('/proxy-cut-url', (req, res) => {
-  const { sourceUrl, startSeconds, endSeconds } = req.body;
-  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
-  if (startSeconds == null || endSeconds == null) return res.status(400).json({ error: 'startSeconds and endSeconds required' });
-  const workDir = path.join(os.tmpdir(), uuidv4());
-  fs.mkdirSync(workDir, { recursive: true });
-  const outPath = path.join(workDir, 'clip.mp4');
-  const cmd = `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${sourceUrl}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -movflags +faststart -y "${outPath}"`;
-  console.log('[proxy-cut-url]', cmd);
-  exec(cmd, { timeout: 180000, maxBuffer: 100*1024*1024 }, (err) => {
-    if (err) {
-      fs.rmSync(workDir, { recursive: true, force: true });
-      return res.status(500).json({ error: err.message });
-    }
-    const stat = fs.statSync(outPath);
-    console.log('[proxy-cut-url] Clip:', (stat.size/1024/1024).toFixed(2), 'MB');
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
-    const stream = fs.createReadStream(outPath);
-    stream.pipe(res);
-    stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
-  });
-});
-
-function hexToAss(hex, alpha='00') {
-  hex = (hex||'#ffffff').replace('#','');
-  if (hex.length===6) {
-    const r=hex.slice(0,2),g=hex.slice(2,4),b=hex.slice(4,6);
+function hexToAss(hex, alpha = '00') {
+  hex = (hex || '#ffffff').replace('#', '');
+  if (hex.length === 6) {
+    const r = hex.slice(0,2), g = hex.slice(2,4), b = hex.slice(4,6);
     return `&H${alpha}${b}${g}${r}`;
   }
   return `&H00ffffff`;
 }
 
 function positionToAlignment(position) {
-  switch((position||'BOTTOM').toUpperCase()) {
+  switch ((position || 'BOTTOM').toUpperCase()) {
     case 'TOP': return 8;
     case 'CENTER': return 5;
     default: return 2;
@@ -84,9 +40,9 @@ function positionToAlignment(position) {
 }
 
 function applyTransform(text, transform) {
-  switch((transform||'NONE').toUpperCase()) {
+  switch ((transform || 'NONE').toUpperCase()) {
     case 'UPPERCASE': return text.toUpperCase();
-    case 'CAPITALIZE': return text.replace(/\b\w/g, c=>c.toUpperCase());
+    case 'CAPITALIZE': return text.replace(/\b\w/g, c => c.toUpperCase());
     default: return text;
   }
 }
@@ -94,30 +50,36 @@ function applyTransform(text, transform) {
 function chunkWords(text, n) {
   const words = text.split(/\s+/).filter(Boolean);
   const chunks = [];
-  for (let i=0; i<words.length; i+=n) chunks.push(words.slice(i,i+n));
+  for (let i = 0; i < words.length; i += n) chunks.push(words.slice(i, i + n));
   return chunks;
 }
 
 function toAssTime(seconds) {
-  const h=Math.floor(seconds/3600);
-  const m=Math.floor((seconds%3600)/60);
-  const s=Math.floor(seconds%60);
-  const cs=Math.round((seconds%1)*100);
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const cs = Math.round((seconds % 1) * 100);
   return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
 }
 
 function generateASS(captionStyle, segments, hookText, videoDuration) {
   const {
-    fontFamily='Arial', fontSize=48, color='#ffffff',
-    strokeColor='#000000', strokeWidth=2, position='BOTTOM',
-    animation='WORD_BY_WORD', textTransform='NONE', maxWordsPerLine=3,
-  } = captionStyle||{};
+    fontFamily = 'Impact',
+    fontSize = 72,
+    color = '#ffffff',
+    strokeColor = '#000000',
+    strokeWidth = 4,
+    position = 'BOTTOM',
+    animation = 'WORD_BY_WORD',
+    textTransform = 'UPPERCASE',
+    maxWordsPerLine = 3,
+  } = captionStyle || {};
 
   const alignment = positionToAlignment(position);
   const primaryColor = hexToAss(color);
   const outlineColor = hexToAss(strokeColor);
   const highlightColor = hexToAss('#ffff00');
-  const anim = (animation||'WORD_BY_WORD').toUpperCase();
+  const anim = (animation || 'WORD_BY_WORD').toUpperCase();
 
   const header = `[Script Info]
 ScriptType: v4.00+
@@ -136,35 +98,152 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
   const lines = [];
 
-  if (!segments || segments.length===0) {
-    const text = applyTransform(hookText||'', textTransform);
-    lines.push(`Dialogue: 0,${toAssTime(0)},${toAssTime(videoDuration||30)},Default,,0,0,0,,${text}`);
-    return header+lines.join('\n');
+  if (!segments || segments.length === 0) {
+    const text = applyTransform(hookText || '', textTransform);
+    lines.push(`Dialogue: 0,${toAssTime(0)},${toAssTime(videoDuration || 30)},Default,,0,0,0,,${text}`);
+    return header + lines.join('\n');
   }
 
   for (const seg of segments) {
-    const segStart = seg.start??0;
-    const segEnd = seg.end??segStart+2;
-    const rawText = applyTransform(seg.text||'', textTransform);
-    if (anim==='FADE') {
+    const segStart = seg.start ?? 0;
+    const segEnd = seg.end ?? segStart + 2;
+    const rawText = applyTransform(seg.text || '', textTransform);
+
+    if (anim === 'FADE') {
       lines.push(`Dialogue: 0,${toAssTime(segStart)},${toAssTime(segEnd)},Default,,0,0,0,,{\\fad(150,150)}${rawText}`);
-    } else if (anim==='LINE_BY_LINE') {
+    } else if (anim === 'LINE_BY_LINE') {
       lines.push(`Dialogue: 0,${toAssTime(segStart)},${toAssTime(segEnd)},Default,,0,0,0,,${rawText}`);
     } else {
-      const mw = Math.max(1,maxWordsPerLine||3);
+      const mw = Math.max(1, maxWordsPerLine || 3);
       const chunks = chunkWords(rawText, mw);
       if (!chunks.length) continue;
-      const chunkDur = (segEnd-segStart)/chunks.length;
-      for (let i=0; i<chunks.length; i++) {
-        const cs2 = segStart+i*chunkDur;
-        const ce = cs2+chunkDur;
-        lines.push(`Dialogue: 0,${toAssTime(cs2)},${toAssTime(ce)},Highlight,,0,0,0,,${chunks[i].join(' ')}`);
+      const chunkDur = (segEnd - segStart) / chunks.length;
+      for (let i = 0; i < chunks.length; i++) {
+        const cs = segStart + i * chunkDur;
+        const ce = cs + chunkDur;
+        lines.push(`Dialogue: 0,${toAssTime(cs)},${toAssTime(ce)},Highlight,,0,0,0,,${chunks[i].join(' ')}`);
       }
     }
   }
 
-  return header+lines.join('\n');
+  return header + lines.join('\n');
 }
+
+// ── Audio extraction — curl download then ffmpeg ─────────────────────────────
+
+app.post('/proxy-extract-audio-url', (req, res) => {
+  const { sourceUrl } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outPath = path.join(workDir, 'audio.mp3');
+
+  console.log('[audio] Downloading:', sourceUrl);
+
+  exec(
+    `curl -L --max-time 600 --retry 3 --retry-delay 5 -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 620000 },
+    (dlErr) => {
+      if (dlErr) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
+      }
+
+      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+      console.log('[audio] Downloaded:', sizeMB, 'MB — extracting audio...');
+
+      const cmd = `ffmpeg -i "${inputPath}" -vn -acodec mp3 -ab 24k -ac 1 -ar 16000 -y "${outPath}"`;
+      exec(cmd, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err) => {
+        if (err) {
+          fs.rmSync(workDir, { recursive: true, force: true });
+          return res.status(500).json({ error: err.message });
+        }
+        const stat = fs.statSync(outPath);
+        console.log('[audio] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', stat.size);
+        const stream = fs.createReadStream(outPath);
+        stream.pipe(res);
+        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
+      });
+    }
+  );
+});
+
+// Keep old names as aliases
+app.post('/extract-audio-full', (req, res) => {
+  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
+  req.url = '/proxy-extract-audio-url';
+  app.handle(req, res);
+});
+
+app.post('/proxy-extract-audio', (req, res) => {
+  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
+  req.url = '/proxy-extract-audio-url';
+  app.handle(req, res);
+});
+
+// ── Clip cutting — curl download then ffmpeg ─────────────────────────────────
+
+app.post('/proxy-cut-url', (req, res) => {
+  const { sourceUrl, startSeconds, endSeconds } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+  if (startSeconds == null || endSeconds == null) return res.status(400).json({ error: 'startSeconds and endSeconds required' });
+
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outPath = path.join(workDir, 'clip.mp4');
+
+  console.log(`[cut] Downloading: ${sourceUrl} (${startSeconds}s - ${endSeconds}s)`);
+
+  exec(
+    `curl -L --max-time 600 --retry 3 --retry-delay 5 -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 620000 },
+    (dlErr) => {
+      if (dlErr) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + dlErr.message });
+      }
+
+      const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+      console.log('[cut] Downloaded:', sizeMB, 'MB — cutting...');
+
+      const cmd = `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${inputPath}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -movflags +faststart -y "${outPath}"`;
+
+      exec(cmd, { timeout: 180000, maxBuffer: 100 * 1024 * 1024 }, (err) => {
+        if (err) {
+          fs.rmSync(workDir, { recursive: true, force: true });
+          return res.status(500).json({ error: err.message });
+        }
+        const stat = fs.statSync(outPath);
+        console.log('[cut] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Length', stat.size);
+        res.setHeader('Content-Disposition', 'attachment; filename="clip.mp4"');
+        const stream = fs.createReadStream(outPath);
+        stream.pipe(res);
+        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
+      });
+    }
+  );
+});
+
+// Keep old names as aliases
+app.post('/cut', (req, res) => {
+  req.body.sourceUrl = req.body.sourceUrl || req.body.inputUrl;
+  req.url = '/proxy-cut-url';
+  app.handle(req, res);
+});
+
+app.post('/proxy-cut', (req, res) => {
+  req.url = '/proxy-cut-url';
+  app.handle(req, res);
+});
+
+// ── Render with ASS captions ─────────────────────────────────────────────────
 
 app.post('/render', async (req, res) => {
   const { inputUrl, captionStyle, segments, hookText } = req.body;
@@ -178,10 +257,17 @@ app.post('/render', async (req, res) => {
 
   try {
     console.log('[render] Downloading:', inputUrl);
-    const videoRes = await fetch(inputUrl);
-    if (!videoRes.ok) throw new Error(`Download failed: HTTP ${videoRes.status}`);
-    const videoBuffer = await videoRes.arrayBuffer();
-    fs.writeFileSync(inputPath, Buffer.from(videoBuffer));
+
+    await new Promise((resolve, reject) => {
+      exec(
+        `curl -L --max-time 300 --retry 3 -o "${inputPath}" "${inputUrl}"`,
+        { timeout: 310000 },
+        (err) => err ? reject(err) : resolve()
+      );
+    });
+
+    const sizeMB = (fs.statSync(inputPath).size / 1024 / 1024).toFixed(2);
+    console.log('[render] Downloaded:', sizeMB, 'MB');
 
     let videoDuration = 30;
     try {
@@ -189,29 +275,32 @@ app.post('/render', async (req, res) => {
         `ffprobe -v error -show_entries format=duration -of csv=p=0 "${inputPath}"`,
         { encoding: 'utf8' }
       ).trim();
-      videoDuration = parseFloat(probe)||30;
-    } catch(_) {}
+      videoDuration = parseFloat(probe) || 30;
+    } catch (_) {}
 
     const assContent = generateASS(captionStyle, segments, hookText, videoDuration);
     fs.writeFileSync(assPath, assContent, 'utf8');
+    console.log('[render] ASS generated, duration:', videoDuration);
 
-    const assEscaped = assPath.replace(/\\/g,'/').replace(/:/g,'\\:');
+    const assEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
     await new Promise((resolve, reject) => {
       const args = [
         '-y', '-i', inputPath,
         '-vf', `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,ass=${assEscaped}`,
         '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-movflags', '+faststart',
         outputPath
       ];
       const ff = spawn('ffmpeg', args);
       ff.stderr.on('data', d => process.stderr.write(d));
-      ff.on('close', code => code===0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg code ${code}`)));
     });
 
     const stat = fs.statSync(outputPath);
-    console.log('[render] Done:', (stat.size/1024/1024).toFixed(2), 'MB');
+    console.log('[render] Done:', (stat.size / 1024 / 1024).toFixed(2), 'MB');
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', stat.size);
     res.setHeader('Content-Disposition', 'attachment; filename="output.mp4"');
@@ -219,11 +308,11 @@ app.post('/render', async (req, res) => {
     stream.pipe(res);
     stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
 
-  } catch(err) {
+  } catch (err) {
     console.error('[render] ERROR:', err.message);
     fs.rmSync(workDir, { recursive: true, force: true });
     res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(process.env.PORT||3000, () => console.log('FFmpeg renderer running'));
+app.listen(PORT, () => console.log(`FFmpeg renderer on port ${PORT}`));
