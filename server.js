@@ -144,6 +144,85 @@ app.post('/extract-audio-full', (req, res) => {
   });
 });
 
+app.post('/proxy-cut', (req, res) => {
+  const { sourceUrl, startSeconds, endSeconds } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+  
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outPath = path.join(workDir, 'clip.mp4');
+
+  const { exec } = require('child_process');
+  
+  exec(
+    `curl -L --max-time 300 -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 310000 },
+    (err) => {
+      if (err) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + err.message });
+      }
+      
+      const cmd = `ffmpeg -ss ${startSeconds} -to ${endSeconds} -i "${inputPath}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset fast -crf 18 -c:a aac -movflags +faststart -y "${outPath}"`;
+      
+      exec(cmd, { timeout: 120000, maxBuffer: 50*1024*1024 }, (err) => {
+        if (err) {
+          fs.rmSync(workDir, { recursive: true, force: true });
+          return res.status(500).json({ error: 'Cut failed: ' + err.message });
+        }
+        
+        const stat = fs.statSync(outPath);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Length', stat.size);
+        const stream = fs.createReadStream(outPath);
+        stream.pipe(res);
+        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
+      });
+    }
+  );
+});
+
+app.post('/proxy-extract-audio', (req, res) => {
+  const { sourceUrl } = req.body;
+  if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
+  
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const inputPath = path.join(workDir, 'input.mp4');
+  const outPath = path.join(workDir, 'audio.mp3');
+
+  const { exec } = require('child_process');
+
+  exec(
+    `curl -L --max-time 300 -o "${inputPath}" "${sourceUrl}"`,
+    { timeout: 310000 },
+    (err) => {
+      if (err) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+        return res.status(500).json({ error: 'Download failed: ' + err.message });
+      }
+      
+      const cmd = `ffmpeg -i "${inputPath}" -vn -acodec mp3 -ab 24k -ac 1 -ar 16000 -y "${outPath}"`;
+      
+      exec(cmd, { timeout: 300000, maxBuffer: 10*1024*1024 }, (err) => {
+        if (err) {
+          fs.rmSync(workDir, { recursive: true, force: true });
+          return res.status(500).json({ error: 'Audio extract failed: ' + err.message });
+        }
+        
+        const stat = fs.statSync(outPath);
+        console.log('Audio extracted:', Math.round(stat.size/1024/1024*100)/100, 'MB');
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', stat.size);
+        const stream = fs.createReadStream(outPath);
+        stream.pipe(res);
+        stream.on('end', () => fs.rmSync(workDir, { recursive: true, force: true }));
+      });
+    }
+  );
+});
+
 app.post('/cut', (req, res) => {
   const { inputUrl, startSeconds, endSeconds } = req.body;
   if (!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
