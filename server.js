@@ -60,6 +60,135 @@ app.post('/proxy-extract-audio-url', (req, res) => {
   );
 });
 
+app.post('/full-pipeline', async (req, res) => {
+  const { 
+    inputUrl, startSeconds, endSeconds,
+    captionStyle, hookText, blurBackground,
+    supabaseUrl, supabaseKey, bucket, jobId
+  } = req.body;
+
+  if (!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
+  if (!supabaseUrl || !supabaseKey) return res.status(400).json({ error: 'supabase credentials required' });
+
+  const workDir = path.join(os.tmpdir(), uuidv4());
+  fs.mkdirSync(workDir, { recursive: true });
+  const cutPath = path.join(workDir, 'cut.mp4');
+  const assPath = path.join(workDir, 'subs.ass');
+  const outPath = path.join(workDir, 'output.mp4');
+
+  try {
+    // STEP 1: Cut clip
+    console.log('[pipeline] Cutting clip:', startSeconds, '-', endSeconds);
+    await new Promise((resolve, reject) => {
+      const args = [
+        '-ss', String(Math.max(0, (startSeconds || 0) - 1)),
+        '-to', String((endSeconds || 30) + 1),
+        '-i', inputUrl,
+        '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-movflags', '+faststart',
+        '-y', cutPath
+      ];
+      const ff = spawn('ffmpeg', args);
+      ff.stderr.on('data', d => process.stderr.write(d));
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`Cut failed: code ${code}`)));
+    });
+
+    const cutSize = (fs.statSync(cutPath).size / 1024 / 1024).toFixed(2);
+    console.log('[pipeline] Cut done:', cutSize, 'MB');
+
+    // STEP 2: Generate ASS captions
+    let videoDuration = 30;
+    try {
+      const probe = execSync(
+        `ffprobe -v error -show_entries format=duration -of csv=p=0 "${cutPath}"`,
+        { encoding: 'utf8' }
+      ).trim();
+      videoDuration = parseFloat(probe) || 30;
+    } catch (_) {}
+
+    const assContent = generateASS(captionStyle || {}, [], hookText || '', videoDuration);
+    fs.writeFileSync(assPath, assContent, 'utf8');
+
+    // STEP 3: Render captions
+    console.log('[pipeline] Rendering captions...');
+    const assEscaped = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
+    let vfFilter;
+    if (blurBackground) {
+      vfFilter = null; // use filter_complex
+    } else {
+      vfFilter = `ass=${assEscaped}`;
+    }
+
+    await new Promise((resolve, reject) => {
+      let args;
+      if (blurBackground) {
+        args = [
+          '-y', '-i', cutPath,
+          '-filter_complex', `[0:v]scale=1080:1920,boxblur=20:5[bg];[0:v]scale=1080:608,setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=${assEscaped}`,
+          '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+          '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+          outPath
+        ];
+      } else {
+        args = [
+          '-y', '-i', cutPath,
+          '-vf', `ass=${assEscaped}`,
+          '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+          '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+          outPath
+        ];
+      }
+      const ff = spawn('ffmpeg', args);
+      ff.stderr.on('data', d => process.stderr.write(d));
+      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`Render failed: code ${code}`)));
+    });
+
+    const outSize = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
+    console.log('[pipeline] Render done:', outSize, 'MB');
+
+    // STEP 4: Upload to Supabase directly from Railway
+    console.log('[pipeline] Uploading to Supabase...');
+    const fileBuffer = fs.readFileSync(outPath);
+    const fileName = `rendered_${jobId || uuidv4()}_${Date.now()}.mp4`;
+
+    const uploadRes = await fetch(
+      `${supabaseUrl}/storage/v1/object/${bucket}/${fileName}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'video/mp4',
+          'x-upsert': 'true'
+        },
+        body: fileBuffer
+      }
+    );
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text();
+      throw new Error('Supabase upload failed: ' + errText);
+    }
+
+    const outputUrl = `${supabaseUrl}/storage/v1/object/public/${bucket}/${fileName}`;
+    console.log('[pipeline] Uploaded:', outputUrl);
+
+    fs.rmSync(workDir, { recursive: true, force: true });
+
+    res.json({ 
+      outputUrl,
+      duration: videoDuration,
+      fileSize: outSize + 'MB'
+    });
+
+  } catch (err) {
+    console.error('[pipeline] ERROR:', err.message);
+    fs.rmSync(workDir, { recursive: true, force: true });
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/proxy-cut-url', (req, res) => {
   const { sourceUrl, startSeconds, endSeconds } = req.body;
   if (!sourceUrl) return res.status(400).json({ error: 'sourceUrl required' });
