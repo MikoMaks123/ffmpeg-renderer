@@ -1,15 +1,3 @@
-# FFmpeg Railway Server — Complete server.js
-
-> **⚠️ ACTION REQUIRED: Replace your entire Railway `server.js` with the code below and push to redeploy.**
->
-> The previous version used `curl` or downloaded the full video to disk before running ffmpeg.  
-> This version streams directly via ffmpeg's built-in HTTP client — no curl, no wget, no full download needed.
-
----
-
-## Complete server.js — copy this entire file
-
-```js
 const express = require('express');
 const { execSync, spawn } = require('child_process');
 const fs = require('fs');
@@ -173,20 +161,7 @@ function generateASS(captionStyle, segments, hookText, videoDuration) {
   const outline = strokeWidth || 2;
   const anim = (animation || 'WORD_BY_WORD').toUpperCase();
 
-  const header = `[Script Info]
-ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,${fontFamily},${fontSize},${primaryColor},${primaryColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1
-Style: Highlight,${fontFamily},${fontSize},${highlightColor},${highlightColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`;
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,${fontFamily},${fontSize},${primaryColor},${primaryColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1\nStyle: Highlight,${fontFamily},${fontSize},${highlightColor},${highlightColor},${outlineColor},&H00000000,1,0,0,0,100,100,0,0,1,${outline},0,${alignment},40,40,60,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
 
   const lines = [];
   if (!segments || segments.length === 0) {
@@ -283,25 +258,3 @@ app.post('/render', async (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.listen(process.env.PORT || 3000, () => console.log('FFmpeg server running'));
-```
-
----
-
-## Deploy
-
-```bash
-git add server.js && git commit -m "fix: use spawn+ffmpeg HTTP, no curl" && git push
-```
-
-Railway auto-deploys on push.
-
----
-
-## Endpoint Summary
-
-| Endpoint | Method | Purpose | How it accesses the video |
-|---|---|---|---|
-| `/proxy-extract-audio-url` | POST | Full video → MP3 audio | `ffmpeg -i <url>` — native HTTP, no curl |
-| `/proxy-cut-url` | POST | Full video → trimmed MP4 | `ffmpeg -ss -to -i <url>` — HTTP seek |
-| `/render` | POST | Clip MP4 → captioned MP4 | `fetch()` (clips are small Supabase URLs) |
-| `/health` | GET | Health check | — |
