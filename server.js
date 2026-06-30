@@ -371,26 +371,29 @@ app.post('/full-pipeline', async (req, res) => {
     const captionFilter = titleEscaped ? `ass=${assEscaped},ass=${titleEscaped}` : `ass=${assEscaped}`;
 
     // Step 4: Render
-    console.log('[pipeline] Rendering captions...');
-    let renderArgs;
-    if (blurBackground) {
-      renderArgs = ['-y', '-i', cutPath, '-filter_complex',
-        `[0:v]scale=1080:1920,boxblur=20:5[bg];[0:v]scale=1080:608,setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,${captionFilter}`,
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath];
-    } else {
-      renderArgs = ['-y', '-i', cutPath, '-vf',
-        `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,${captionFilter}`,
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outputPath];
-    }
+    // Step 4: Render
+console.log(`[pipeline] Rendering captions, blurBackground=${blurBackground}`);
+let renderArgs;
+if (blurBackground) {
+  const fc = `[0:v]scale=720:1280,boxblur=20:5[bg];[0:v]scale=720:405,setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,${captionFilter}`;
+  renderArgs = ['-y', '-i', cutPath, '-filter_complex', fc,
+    '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast',
+    '-threads', '1', '-c:a', 'aac', '-b:a', '96k',
+    '-movflags', '+faststart', outputPath];
+} else {
+  const vf = `scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,${captionFilter}`;
+  renderArgs = ['-y', '-i', cutPath, '-vf', vf,
+    '-c:v', 'libx264', '-crf', '28', '-preset', 'ultrafast',
+    '-threads', '1', '-c:a', 'aac', '-b:a', '96k',
+    '-movflags', '+faststart', outputPath];
+}
 
-    await new Promise((resolve, reject) => {
-      const ff = spawn('ffmpeg', renderArgs);
-      let stderrBuf = '';
-      ff.stderr.on('data', d => { process.stderr.write(d); stderrBuf += d.toString(); });
-      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`Render failed (${code}): ${stderrBuf.slice(-300)}`)));
-    });
+await new Promise((resolve, reject) => {
+  const ff = spawn('ffmpeg', renderArgs);
+  let stderrBuf = '';
+  ff.stderr.on('data', d => { process.stderr.write(d); stderrBuf += d.toString(); });
+  ff.on('close', code => code === 0 ? resolve() : reject(new Error(`Render failed (${code}): ${stderrBuf.slice(-5000)}`)));
+});
 
     // Step 5: Upload to Supabase
     const stat = fs.statSync(outputPath);
